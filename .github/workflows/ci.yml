@@ -1,0 +1,226 @@
+name: CI/CD
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches: [main, homolog]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ROLE: arn:aws:iam::814623398856:role/auto-repair-github-actions
+  ECR_REPOSITORY: auto-repair-execution-service
+  EKS_CLUSTER: auto-repair-eks
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Lint
+        run: bin/rubocop
+
+      - name: Scan for Rails security vulnerabilities
+        run: bin/brakeman --no-pager
+
+      - name: Scan for vulnerable gems
+        run: bin/bundler-audit
+
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      localstack:
+        image: localstack/localstack:4.4
+        env:
+          SERVICES: dynamodb,sns,sqs
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd="curl -sf http://localhost:4566/_localstack/health || exit 1"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+
+    env:
+      RAILS_ENV: test
+      JWT_SECRET: ci_test_secret_do_not_use_in_production
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://localhost:4566
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Unit and request tests (RSpec, coverage >= 80%)
+        run: bundle exec rspec --format progress
+
+      - name: BDD scenarios (Cucumber)
+        run: bundle exec cucumber --profile ci
+
+      - name: Coverage summary
+        run: |
+          COVERED=$(jq '.result.line' coverage/.last_run.json)
+          echo "### Coverage: ${COVERED}%" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: |
+            coverage/
+            tmp/cucumber.html
+          include-hidden-files: true
+
+  quality:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-reports
+
+      - name: SonarQube Cloud analysis
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Quality gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate kustomize overlays
+        run: |
+          kubectl kustomize k8s/overlays/prod > /dev/null
+          kubectl kustomize k8s/overlays/homolog > /dev/null
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Validate terraform
+        working-directory: terraform
+        run: |
+          terraform fmt -check
+          terraform init -backend=false -input=false
+          terraform validate
+
+  # Runs only while the AWS environment is up (repository variable
+  # DEPLOY_ENABLED=true); re-run anytime with "Run workflow".
+  deploy:
+    needs: [security, test, quality, manifests]
+    if: github.event_name != 'pull_request' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref == 'refs/heads/main' && 'production' || 'homolog' }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve target environment
+        id: env
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "name=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=homolog" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Provision DynamoDB tables, SQS queue and Pod Identity
+        working-directory: terraform
+        run: |
+          terraform init -input=false
+          terraform apply -input=false -auto-approve
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: ${{ github.sha }}
+        run: |
+          docker build -f Dockerfile.production \
+            -t "$REGISTRY/$ECR_REPOSITORY:$TAG" \
+            -t "$REGISTRY/$ECR_REPOSITORY:${{ steps.env.outputs.name }}" .
+          docker push "$REGISTRY/$ECR_REPOSITORY:$TAG"
+          docker push "$REGISTRY/$ECR_REPOSITORY:${{ steps.env.outputs.name }}"
+
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER"
+
+      - name: Create namespace and secrets
+        env:
+          NAMESPACE: auto-repair-execution-${{ steps.env.outputs.name }}
+        run: |
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+          SECRET=$(aws secretsmanager get-secret-value --secret-id auto-repair/app --query SecretString --output text)
+          JWT=$(echo "$SECRET" | jq -r .jwt_secret)
+
+          kubectl -n "$NAMESPACE" create secret generic execution-secrets \
+            --from-literal=JWT_SECRET="$JWT" \
+            --from-literal=SECRET_KEY_BASE="$(openssl rand -hex 64)" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          NAMESPACE: auto-repair-execution-${{ steps.env.outputs.name }}
+          OVERLAY: k8s/overlays/${{ steps.env.outputs.name }}
+        run: |
+          sed -i "s|newName: .*|newName: $REGISTRY/$ECR_REPOSITORY|" "$OVERLAY/kustomization.yaml"
+          sed -i "s|newTag: .*|newTag: ${{ github.sha }}|" "$OVERLAY/kustomization.yaml"
+
+          kubectl -n "$NAMESPACE" delete job dynamo-seed --ignore-not-found
+          kubectl apply -k "$OVERLAY"
+
+          kubectl -n "$NAMESPACE" wait --for=condition=complete job/dynamo-seed --timeout=300s
+          kubectl -n "$NAMESPACE" rollout status deployment/api --timeout=300s
+          kubectl -n "$NAMESPACE" rollout status deployment/worker --timeout=300s
+
+      - name: Smoke test
+        if: steps.env.outputs.name == 'prod'
+        run: |
+          GATEWAY=$(aws apigatewayv2 get-apis \
+            --query "Items[?Name=='auto-repair-api'].ApiEndpoint | [0]" --output text)
+          # Unauthenticated call routed by the gateway to this service must be rejected by the app.
+          for i in $(seq 1 10); do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$GATEWAY/api/v1/parts")
+            [ "$STATUS" = "401" ] && echo "Execution Service is responding through the API Gateway" && exit 0
+            sleep 5
+          done
+          echo "Unexpected status $STATUS" && exit 1

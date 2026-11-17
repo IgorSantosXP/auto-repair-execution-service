@@ -1,0 +1,21 @@
+# Loads the demo parts catalog (idempotent). Tables are created by Terraform.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dynamo-seed
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      serviceAccountName: execution-service
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          image: auto-repair-execution-service
+          command: ["./bin/rails", "dynamo:seed"]
+          envFrom:
+            - configMapRef:
+                name: execution-config
+            - secretRef:
+                name: execution-secrets

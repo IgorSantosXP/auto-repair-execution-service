@@ -1,0 +1,49 @@
+# Saga participant worker: consumes commands from the execution SQS queue and
+# relays the DynamoDB outbox to SNS.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  labels:
+    app: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+        tags.datadoghq.com/service: execution-service
+      annotations:
+        ad.datadoghq.com/worker.logs: '[{"source":"ruby","service":"execution-service"}]'
+    spec:
+      serviceAccountName: execution-service
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: worker
+          image: auto-repair-execution-service
+          imagePullPolicy: Always
+          command: ["./bin/rails", "messaging:work"]
+          env:
+            - name: DD_AGENT_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          envFrom:
+            - configMapRef:
+                name: execution-config
+            - secretRef:
+                name: execution-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 250m
+              memory: 512Mi
