@@ -1,0 +1,5 @@
+#!/bin/bash -e
+
+# Tables are created by Terraform on AWS; locally they are provisioned by the
+# app boot (DYNAMODB_AUTO_PROVISION=true) or by `bin/rails dynamo:setup`.
+exec "${@}"

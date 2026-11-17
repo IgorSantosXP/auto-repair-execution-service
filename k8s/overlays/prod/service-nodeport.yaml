@@ -1,0 +1,11 @@
+# Exposed on the node port the shared NLB forwards to (infra-k8s services.tf).
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  type: NodePort
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30082

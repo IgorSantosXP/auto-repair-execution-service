@@ -1,5 +1,9 @@
 # Execution Service (Execução e Produção)
 
+[![CI/CD](https://github.com/IgorSantosXP/auto-repair-execution-service/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/IgorSantosXP/auto-repair-execution-service/actions/workflows/ci.yml)
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=IgorSantosXP_auto-repair-execution-service&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=IgorSantosXP_auto-repair-execution-service)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=IgorSantosXP_auto-repair-execution-service&metric=coverage)](https://sonarcloud.io/component_measures?id=IgorSantosXP_auto-repair-execution-service&metric=coverage)
+
 Microsserviço da fase 4 do sistema de oficina mecânica (FIAP SOAT). Controla a **fila de execução** das ordens de serviço
 (diagnóstico, reparo e finalização) e é dono do **catálogo de peças e do estoque**. Participa da saga orquestrada pelo
 OS Service: reserva o estoque quando o pagamento é aprovado e, se não houver peças, devolve uma falha que dispara a compensação

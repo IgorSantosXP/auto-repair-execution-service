@@ -1,0 +1,51 @@
+x-service: &service
+  build:
+    context: .
+    dockerfile: Dockerfile.development
+  environment: &env
+    RAILS_ENV: development
+    JWT_SECRET: dev_secret_change_in_production
+    SERVICE_NAME: execution-service
+    DD_SERVICE: execution-service
+    AWS_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    AWS_ENDPOINT_URL: http://localstack:4566
+    DYNAMODB_AUTO_PROVISION: "true"
+    DYNAMODB_TABLE_PREFIX: auto-repair-local-execution
+    MESSAGING_AUTO_PROVISION: "true"
+    EVENTS_TOPIC_NAME: auto-repair-local-events
+    QUEUE_NAME: auto-repair-local-execution
+  volumes:
+    - .:/rails
+    - bundle_data:/usr/local/bundle
+  depends_on:
+    localstack:
+      condition: service_healthy
+
+services:
+  localstack:
+    image: localstack/localstack:4.4
+    environment:
+      SERVICES: sns,sqs,dynamodb
+      # Queue URLs use the request host (localstack:4566) instead of a *.localhost.localstack.cloud name
+      SQS_ENDPOINT_STRATEGY: path
+      LOCALSTACK_HOST: localstack:4566
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    <<: *service
+    ports:
+      - "${EXECUTION_PORT:-3002}:3000"
+
+  worker:
+    <<: *service
+    restart: on-failure
+    command: bash -c "bundle check || bundle install && bundle exec rails messaging:work"
+
+volumes:
+  bundle_data:
